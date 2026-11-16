@@ -9,6 +9,7 @@ const err = ref('')
 const busy = ref(false)
 const loadDay = ref('')
 const lastJob = ref(null)
+const lastDecisions = ref([])
 
 async function refresh() {
   rows.value = await getJson(`/api/layers/贴源?domain_id=${domainId.value}`)
@@ -32,6 +33,9 @@ async function reload() {
       domain_id: domainId.value,
       biz_day: loadDay.value || null,
     })
+    lastDecisions.value = await getJson(
+      `/api/close-decisions?load_id=${lastJob.value.id}`,
+    )
     await refresh()
   } catch (e) {
     err.value = String(e.message || e)
@@ -59,8 +63,29 @@ async function reload() {
       <p>
         最近装载：<span :class="lastJob.reject_count ? 'warn' : 'ok'">{{ lastJob.status }}</span>
         ，输入 {{ lastJob.in_count }} 行，写入 {{ lastJob.out_count }} 行，拒绝 {{ lastJob.reject_count }} 行
+        <template v-if="lastJob.reason_code">，拒绝原因码 <span class="warn">{{ lastJob.reason_code }}</span></template>
       </p>
       <p class="muted">{{ lastJob.message }}</p>
+      <h4 v-if="lastDecisions.length">本次装载关闭裁决证明（按装载编号 {{ lastJob.id }} 只读）</h4>
+      <table v-if="lastDecisions.length">
+        <thead>
+          <tr><th>目标日</th><th>是否关闭</th><th>写路径是否放行</th><th>原因码</th></tr>
+        </thead>
+        <tbody>
+          <tr v-for="d in lastDecisions" :key="d.id" :class="d.write_allowed ? '' : 'warn'">
+            <td>{{ d.biz_day }}</td>
+            <td>
+              <span v-if="d.is_closed" class="badge badge-closed">已关闭</span>
+              <span v-else class="badge badge-open">未关闭</span>
+            </td>
+            <td>
+              <span v-if="d.write_allowed" class="badge badge-open">放行</span>
+              <span v-else class="badge badge-closed">拒绝</span>
+            </td>
+            <td>{{ d.reason_code || '—' }}</td>
+          </tr>
+        </tbody>
+      </table>
     </div>
     <div class="panel">
       <table>

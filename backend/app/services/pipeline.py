@@ -18,6 +18,11 @@ CLOSED_LOAD_REASON = "业务日{day}已关闭，贴源装载被拒绝（跳过{c
 CLOSED_JOB_REASON = "业务日{day}已关闭，{step}被拒绝"
 CLOSED_SKIP_REASON = "业务日{day}已关闭，已跳过该日{count}行"
 
+# 拒绝原因码：稳定可机读，说明文案在 message 里随名单刷新保持一致
+REASON_PASTE_CLOSED = "BIZ_DAY_CLOSED_PASTE_LOAD"
+REASON_STEP_CLOSED = "BIZ_DAY_CLOSED_LAYER_JOB"
+REASON_SKIP_CLOSED = "BIZ_DAY_CLOSED_SKIPPED"
+
 
 class RejectError(ValueError):
     """整单被关闭态拒绝：调用方据此返回 400，且拒绝已落任务结果。"""
@@ -113,6 +118,70 @@ def reopen_biz_day(domain_id: int, biz_day: str) -> None:
             (domain_id, biz_day),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def _record_close_decisions(
+    conn,
+    domain_id: int,
+    job_id: int | None,
+    step: str,
+    decisions: dict[str, tuple[bool, bool, str]],
+) -> None:
+    """落关闭裁决证明：decisions 为 {业务日: (是否关闭, 写路径是否放行, 原因码)}。"""
+    for day in sorted(decisions):
+        is_closed, write_allowed, reason_code = decisions[day]
+        conn.execute(
+            """
+            INSERT INTO close_decisions(
+              domain_id, biz_day, is_closed, write_allowed, job_id, step, reason_code
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                domain_id,
+                day,
+                1 if is_closed else 0,
+                1 if write_allowed else 0,
+                job_id,
+                step,
+                reason_code,
+            ),
+        )
+
+
+def list_close_decisions(
+    domain_id: int | None = None,
+    job_id: int | None = None,
+    load_id: int | None = None,
+) -> list[dict]:
+    """关闭裁决证明只读查询；load_id 即贴源装载任务（layer_jobs）编号。"""
+    sql = """
+        SELECT c.*, d.name AS domain_name
+        FROM close_decisions c JOIN domains d ON d.id = c.domain_id
+        WHERE 1=1
+    """
+    args: list = []
+    if domain_id is not None:
+        sql += " AND c.domain_id=?"
+        args.append(domain_id)
+    if job_id is not None:
+        sql += " AND c.job_id=?"
+        args.append(job_id)
+    if load_id is not None:
+        sql += " AND c.job_id=? AND c.step='paste_load'"
+        args.append(load_id)
+    sql += " ORDER BY c.id"
+    conn = connect()
+    try:
+        rows = conn.execute(sql, args).fetchall()
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["is_closed"] = bool(d["is_closed"])
+            d["write_allowed"] = bool(d["write_allowed"])
+            out.append(d)
+        return out
     finally:
         conn.close()
 
@@ -241,12 +310,14 @@ def _insert_job(
     drop_count: int,
     reject_count: int = 0,
     biz_day: str | None = None,
+    reason_code: str = "",
 ) -> dict:
     cur = conn.execute(
         """
         INSERT INTO layer_jobs(
-          domain_id, step, status, message, in_count, out_count, drop_count, reject_count, biz_day
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          domain_id, step, status, message, in_count, out_count, drop_count,
+          reject_count, reason_code, biz_day
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             domain_id,
@@ -257,6 +328,7 @@ def _insert_job(
             out_count,
             drop_count,
             reject_count,
+            reason_code,
             biz_day,
         ),
     )
@@ -295,13 +367,41 @@ def load_paste_fixture(domain_id: int, biz_day: str | None = None) -> dict:
     conn = connect()
     try:
         closed = _closed_days(conn, domain_id)
+        decisions: dict[str, tuple[bool, bool, str]] = {}
+
+        # 定点装载关闭日：整单拒绝，不写贴源，拒绝落任务结果与裁决证明
+        if biz_day is not None and biz_day in closed:
+            reject_count = len(records)
+            message = CLOSED_LOAD_REASON.format(day=biz_day, count=reject_count)
+            job = _insert_job(
+                conn,
+                domain_id,
+                "paste_load",
+                "拒绝",
+                message,
+                reject_count,
+                0,
+                0,
+                reject_count,
+                biz_day,
+                REASON_PASTE_CLOSED,
+            )
+            decisions[biz_day] = (True, False, REASON_PASTE_CLOSED)
+            _record_close_decisions(conn, domain_id, job["id"], "paste_load", decisions)
+            conn.commit()
+            job["step_label"] = STEP_LABEL["paste_load"]
+            return job
+
+        # 全量装载：已关闭日全部拒绝跳过且不重写其贴源；未关闭日整批重写
         accepted: list[dict] = []
         rejected_days: dict[str, int] = {}
         for obj in records:
             day = obj.get("业务日") or ""
+            if day in closed:
+                rejected_days[day] = rejected_days.get(day, 0) + 1
+                continue
             accepted.append(obj)
 
-        # 只重写涉及到的未关闭日；已关闭日的贴源保持原样不动
         target_days = {(obj.get("业务日") or "") for obj in accepted}
         if target_days:
             placeholders = ",".join("?" for _ in target_days)
@@ -329,6 +429,12 @@ def load_paste_fixture(domain_id: int, biz_day: str | None = None) -> dict:
             )
 
         reject_count = sum(rejected_days.values())
+        # 裁决证明：拒绝日与放行日都要落，与本次装载实际裁决同源
+        for day, count in sorted(rejected_days.items()):
+            decisions[day] = (True, False, REASON_PASTE_CLOSED)
+        for day in sorted(target_days):
+            decisions[day] = (False, True, "")
+
         notes = [
             CLOSED_LOAD_REASON.format(day=day, count=count)
             for day, count in sorted(rejected_days.items())
@@ -339,6 +445,7 @@ def load_paste_fixture(domain_id: int, biz_day: str | None = None) -> dict:
         if not records:
             message = "夹具中没有匹配的业务日数据，未写入任何行"
         status = _job_status(len(accepted), reject_count)
+        reason_code = REASON_PASTE_CLOSED if reject_count else ""
         job = _insert_job(
             conn,
             domain_id,
@@ -350,7 +457,9 @@ def load_paste_fixture(domain_id: int, biz_day: str | None = None) -> dict:
             0,
             reject_count,
             biz_day,
+            reason_code,
         )
+        _record_close_decisions(conn, domain_id, job["id"], "paste_load", decisions)
         conn.commit()
         job["step_label"] = STEP_LABEL["paste_load"]
         return job
@@ -367,6 +476,36 @@ def run_paste_to_detail(domain_id: int, biz_day: str | None = None) -> dict:
     conn = connect()
     try:
         closed = _closed_days(conn, domain_id)
+        decisions: dict[str, tuple[bool, bool, str]] = {}
+
+        # 定点重算关闭日：整单拒绝（400），拒绝已落任务结果与裁决证明
+        if biz_day is not None and biz_day in closed:
+            paste = conn.execute(
+                "SELECT * FROM layer_paste WHERE domain_id=? AND biz_day=? ORDER BY id",
+                (domain_id, biz_day),
+            ).fetchall()
+            reject_count = len(paste)
+            message = CLOSED_JOB_REASON.format(
+                day=biz_day, count=reject_count, step=STEP_LABEL["paste_to_detail"]
+            )
+            job = _insert_job(
+                conn,
+                domain_id,
+                "paste_to_detail",
+                "拒绝",
+                message,
+                reject_count,
+                0,
+                0,
+                reject_count,
+                biz_day,
+                REASON_STEP_CLOSED,
+            )
+            decisions[biz_day] = (True, False, REASON_STEP_CLOSED)
+            _record_close_decisions(conn, domain_id, job["id"], "paste_to_detail", decisions)
+            conn.commit()
+            job["step_label"] = STEP_LABEL["paste_to_detail"]
+            raise RejectError(message, job)
 
         if biz_day is not None:
             conn.execute(
@@ -377,15 +516,29 @@ def run_paste_to_detail(domain_id: int, biz_day: str | None = None) -> dict:
                 "SELECT * FROM layer_paste WHERE domain_id=? AND biz_day=? ORDER BY id",
                 (domain_id, biz_day),
             ).fetchall()
+            target_days = {biz_day}
         else:
-            conn.execute("DELETE FROM layer_detail WHERE domain_id=?", (domain_id,))
             paste = conn.execute(
                 "SELECT * FROM layer_paste WHERE domain_id=? ORDER BY id", (domain_id,)
             ).fetchall()
+            # 关闭名单中的日子即便没有贴源行也要给出裁决
+            target_days = {r["biz_day"] for r in paste} | closed
+            open_days = target_days - closed
+            if open_days:
+                placeholders = ",".join("?" for _ in open_days)
+                conn.execute(
+                    f"DELETE FROM layer_detail WHERE domain_id=? AND biz_day IN ({placeholders})",
+                    (domain_id, *sorted(open_days)),
+                )
 
         out = drop = reject_count = 0
         rejected_days: dict[str, int] = {}
         for row in paste:
+            if row["biz_day"] in closed:
+                # 全量重跑不触碰关闭日：跳过并计数，已有明细原样保留
+                reject_count += 1
+                rejected_days[row["biz_day"]] = rejected_days.get(row["biz_day"], 0) + 1
+                continue
             store_name = (row["store_name"] or "").strip()
             amount = float(row["amount"])
             if not store_name or amount < 0:
@@ -410,6 +563,12 @@ def run_paste_to_detail(domain_id: int, biz_day: str | None = None) -> dict:
             )
             out += 1
 
+        for day in sorted(target_days):
+            if day in closed:
+                decisions[day] = (True, False, REASON_SKIP_CLOSED)
+            else:
+                decisions[day] = (False, True, "")
+
         notes = [
             CLOSED_SKIP_REASON.format(day=day, count=count)
             for day, count in sorted(rejected_days.items())
@@ -417,6 +576,7 @@ def run_paste_to_detail(domain_id: int, biz_day: str | None = None) -> dict:
         message = "清洗完成，剔除门店名为空或金额为负的行"
         if notes:
             message += "；" + "；".join(notes)
+        reason_code = REASON_SKIP_CLOSED if reject_count else ""
         status = _job_status(out, reject_count)
         job = _insert_job(
             conn,
@@ -429,7 +589,9 @@ def run_paste_to_detail(domain_id: int, biz_day: str | None = None) -> dict:
             drop,
             reject_count,
             biz_day,
+            reason_code,
         )
+        _record_close_decisions(conn, domain_id, job["id"], "paste_to_detail", decisions)
         conn.commit()
         job["step_label"] = STEP_LABEL["paste_to_detail"]
         return job
@@ -446,6 +608,36 @@ def run_detail_to_summary(domain_id: int, biz_day: str | None = None) -> dict:
     conn = connect()
     try:
         closed = _closed_days(conn, domain_id)
+        decisions: dict[str, tuple[bool, bool, str]] = {}
+
+        # 定点重算关闭日：整单拒绝（400），拒绝已落任务结果与裁决证明
+        if biz_day is not None and biz_day in closed:
+            detail = conn.execute(
+                "SELECT * FROM layer_detail WHERE domain_id=? AND biz_day=? ORDER BY id",
+                (domain_id, biz_day),
+            ).fetchall()
+            reject_count = len(detail)
+            message = CLOSED_JOB_REASON.format(
+                day=biz_day, count=reject_count, step=STEP_LABEL["detail_to_summary"]
+            )
+            job = _insert_job(
+                conn,
+                domain_id,
+                "detail_to_summary",
+                "拒绝",
+                message,
+                reject_count,
+                0,
+                0,
+                reject_count,
+                biz_day,
+                REASON_STEP_CLOSED,
+            )
+            decisions[biz_day] = (True, False, REASON_STEP_CLOSED)
+            _record_close_decisions(conn, domain_id, job["id"], "detail_to_summary", decisions)
+            conn.commit()
+            job["step_label"] = STEP_LABEL["detail_to_summary"]
+            raise RejectError(message, job)
 
         if biz_day is not None:
             conn.execute(
@@ -456,16 +648,30 @@ def run_detail_to_summary(domain_id: int, biz_day: str | None = None) -> dict:
                 "SELECT * FROM layer_detail WHERE domain_id=? AND biz_day=? ORDER BY id",
                 (domain_id, biz_day),
             ).fetchall()
+            target_days = {biz_day}
         else:
-            conn.execute("DELETE FROM layer_summary WHERE domain_id=?", (domain_id,))
             detail = conn.execute(
                 "SELECT * FROM layer_detail WHERE domain_id=? ORDER BY id", (domain_id,)
             ).fetchall()
+            # 关闭名单中的日子即便没有明细行也要给出裁决
+            target_days = {r["biz_day"] for r in detail} | closed
+            open_days = target_days - closed
+            if open_days:
+                placeholders = ",".join("?" for _ in open_days)
+                conn.execute(
+                    f"DELETE FROM layer_summary WHERE domain_id=? AND biz_day IN ({placeholders})",
+                    (domain_id, *sorted(open_days)),
+                )
 
         buckets: dict[tuple, dict] = {}
         reject_count = 0
         rejected_days: dict[str, int] = {}
         for row in detail:
+            if row["biz_day"] in closed:
+                # 全量重跑不触碰关闭日：跳过并计数，已有汇总原样保留
+                reject_count += 1
+                rejected_days[row["biz_day"]] = rejected_days.get(row["biz_day"], 0) + 1
+                continue
             key = (row["biz_day"], row["store_code"])
             b = buckets.setdefault(
                 key,
@@ -484,6 +690,12 @@ def run_detail_to_summary(domain_id: int, biz_day: str | None = None) -> dict:
                 (domain_id, b["biz_day"], b["store_code"], b["amount"], b["qty"], b["n"]),
             )
 
+        for day in sorted(target_days):
+            if day in closed:
+                decisions[day] = (True, False, REASON_SKIP_CLOSED)
+            else:
+                decisions[day] = (False, True, "")
+
         notes = [
             CLOSED_SKIP_REASON.format(day=day, count=count)
             for day, count in sorted(rejected_days.items())
@@ -491,6 +703,7 @@ def run_detail_to_summary(domain_id: int, biz_day: str | None = None) -> dict:
         message = "按业务日+门店编码汇总"
         if notes:
             message += "；" + "；".join(notes)
+        reason_code = REASON_SKIP_CLOSED if reject_count else ""
         status = _job_status(len(buckets), reject_count)
         job = _insert_job(
             conn,
@@ -503,7 +716,9 @@ def run_detail_to_summary(domain_id: int, biz_day: str | None = None) -> dict:
             0,
             reject_count,
             biz_day,
+            reason_code,
         )
+        _record_close_decisions(conn, domain_id, job["id"], "detail_to_summary", decisions)
         conn.commit()
         job["step_label"] = STEP_LABEL["detail_to_summary"]
         return job

@@ -6,11 +6,23 @@ const domains = ref([])
 const domainId = ref(1)
 const bizDay = ref('')
 const jobs = ref([])
+const decisions = ref([])
 const err = ref('')
 const busy = ref(false)
 
 async function refresh() {
   jobs.value = await getJson(`/api/jobs?domain_id=${domainId.value}`)
+  await refreshDecisions()
+}
+
+async function refreshDecisions() {
+  decisions.value = await getJson(
+    `/api/close-decisions?domain_id=${domainId.value}`,
+  )
+}
+
+function decisionsOf(jobId) {
+  return decisions.value.filter((d) => d.job_id === jobId)
 }
 
 onMounted(async () => {
@@ -36,7 +48,7 @@ async function run(step) {
     })
     await refresh()
   } catch (e) {
-    // 关闭日拒绝同样已落任务结果，刷新让「拒绝」记录出现在列表
+    // 关闭日拒绝同样已落任务结果，刷新让「拒绝」记录与裁决证明出现在列表
     err.value = String(e.message || e)
     await refresh()
   } finally {
@@ -66,7 +78,10 @@ async function run(step) {
     <div class="panel">
       <table>
         <thead>
-          <tr><th>编号</th><th>步骤</th><th>状态</th><th>业务日</th><th>说明</th><th>输入</th><th>写入</th><th>剔除</th><th>拒绝</th><th>时间</th></tr>
+          <tr>
+            <th>编号</th><th>步骤</th><th>状态</th><th>业务日</th><th>说明</th>
+            <th>输入</th><th>写入</th><th>剔除</th><th>拒绝</th><th>拒绝原因码</th><th>时间</th>
+          </tr>
         </thead>
         <tbody>
           <tr v-for="j in jobs" :key="j.id">
@@ -79,11 +94,62 @@ async function run(step) {
             <td>{{ j.out_count }}</td>
             <td>{{ j.drop_count }}</td>
             <td>{{ j.reject_count }}</td>
+            <td>{{ j.reason_code || '—' }}</td>
             <td>{{ j.created_at }}</td>
           </tr>
         </tbody>
       </table>
       <p v-if="!jobs.length" class="muted">还没有任务记录。</p>
+    </div>
+
+    <div class="panel">
+      <h3>关闭裁决证明（按任务只读，与关闭名单、贴源按日计数同库同源）</h3>
+      <table v-if="decisions.length">
+        <thead>
+          <tr>
+            <th>证明编号</th><th>任务编号</th><th>环节</th><th>目标日</th>
+            <th>是否关闭</th><th>写路径是否放行</th><th>原因码</th><th>裁决时间</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr
+            v-for="d in [...decisions].reverse()"
+            :key="d.id"
+            :class="d.write_allowed ? '' : 'warn'"
+          >
+            <td>{{ d.id }}</td>
+            <td>{{ d.job_id ?? '—' }}</td>
+            <td>{{ d.step }}</td>
+            <td>{{ d.biz_day }}</td>
+            <td>
+              <span v-if="d.is_closed" class="badge badge-closed">已关闭</span>
+              <span v-else class="badge badge-open">未关闭</span>
+            </td>
+            <td>
+              <span v-if="d.write_allowed" class="badge badge-open">放行</span>
+              <span v-else class="badge badge-closed">拒绝</span>
+            </td>
+            <td>{{ d.reason_code || '—' }}</td>
+            <td>{{ d.created_at }}</td>
+          </tr>
+        </tbody>
+      </table>
+      <p v-else class="muted">
+        暂无裁决证明。执行一次贴源装载或分层任务后，每个目标日都会在此留下关闭裁决。
+      </p>
+      <p class="muted" v-if="jobs.length">
+        最近任务 {{ jobs[0].id }} 的裁决：
+        <template v-if="decisionsOf(jobs[0].id).length">
+          <span
+            v-for="d in decisionsOf(jobs[0].id)"
+            :key="d.id"
+            class="inline-proof"
+          >
+            {{ d.biz_day }}（{{ d.write_allowed ? '放行' : '拒绝' }}）
+          </span>
+        </template>
+        <span v-else>无</span>
+      </p>
     </div>
   </div>
 </template>

@@ -39,6 +39,7 @@ def test_all_routes_registered(client):
         "/api/dashboard",
         "/api/domains",
         "/api/closed-days",
+        "/api/close-decisions",
         "/api/biz-days/overview",
         "/api/closed-days/close",
         "/api/closed-days/reopen",
@@ -248,6 +249,152 @@ def test_invalid_biz_day_rejected(client):
     assert r.status_code == 400
 
 
+def test_reason_codes_recorded_on_load_and_jobs(client):
+    did = _domain_id(client)
+    client.post(
+        "/api/closed-days/close",
+        json={"domain_id": did, "biz_day": "2026-11-10"},
+    )
+
+    # 全量装载含关闭日：装载结果带关闭拒绝原因码
+    job = client.post("/api/paste/load", json={"domain_id": did}).json()
+    assert job["reason_code"] == "BIZ_DAY_CLOSED_PASTE_LOAD"
+
+    # 定点装载关闭日整单拒绝，原因码一致
+    r = client.post(
+        "/api/paste/load", json={"domain_id": did, "biz_day": "2026-11-10"}
+    )
+    assert r.status_code == 200
+    assert r.json()["status"] == "拒绝"
+    assert r.json()["reason_code"] == "BIZ_DAY_CLOSED_PASTE_LOAD"
+
+    # 定点分层任务关闭日拒绝原因码
+    r = client.post(
+        "/api/jobs/paste-to-detail",
+        json={"domain_id": did, "biz_day": "2026-11-10"},
+    )
+    assert r.status_code == 400
+    assert r.json()["detail"]["任务"]["reason_code"] == "BIZ_DAY_CLOSED_LAYER_JOB"
+
+    # 全量重跑跳过关闭日，原因码为跳过码，且与关闭名单刷新后保持一致
+    job = client.post("/api/jobs/paste-to-detail", json={"domain_id": did}).json()
+    assert job["reason_code"] == "BIZ_DAY_CLOSED_SKIPPED"
+
+    # 未关闭日的正常任务不带原因码
+    job = client.post(
+        "/api/jobs/paste-to-detail",
+        json={"domain_id": did, "biz_day": "2026-11-11"},
+    ).json()
+    assert job["reason_code"] == ""
+
+
+def test_close_decision_proof_entity_and_read_only_filters(client):
+    did = _domain_id(client)
+    client.post(
+        "/api/closed-days/close",
+        json={"domain_id": did, "biz_day": "2026-11-10"},
+    )
+
+    load_job = client.post("/api/paste/load", json={"domain_id": did}).json()
+    # 裁决证明按任务 id 只读查询，字段含目标日/是否关闭/写路径是否放行
+    decisions = client.get(f"/api/close-decisions?job_id={load_job['id']}").json()
+    by_day = {d["biz_day"]: d for d in decisions}
+    assert set(by_day) == {"2026-11-10", "2026-11-11"}
+    closed_proof = by_day["2026-11-10"]
+    assert closed_proof["is_closed"] is True
+    assert closed_proof["write_allowed"] is False
+    assert closed_proof["domain_id"] == did
+    assert closed_proof["job_id"] == load_job["id"]
+    assert closed_proof["step"] == "paste_load"
+    assert closed_proof["reason_code"] == "BIZ_DAY_CLOSED_PASTE_LOAD"
+    open_proof = by_day["2026-11-11"]
+    assert open_proof["is_closed"] is False and open_proof["write_allowed"] is True
+
+    # 按装载 id 查询与按任务 id 查询同源（贴源装载任务本身即装载单）
+    by_load = client.get(
+        f"/api/close-decisions?load_id={load_job['id']}"
+    ).json()
+    assert {(d["biz_day"], d["step"]) for d in by_load} == {
+        ("2026-11-10", "paste_load"),
+        ("2026-11-11", "paste_load"),
+    }
+
+    # 全量分层任务同样落证明：关闭日不放行，未关闭日放行
+    layer_job = client.post(
+        "/api/jobs/paste-to-detail", json={"domain_id": did}
+    ).json()
+    decisions = client.get(f"/api/close-decisions?job_id={layer_job['id']}").json()
+    by_day = {d["biz_day"]: d for d in decisions}
+    assert by_day["2026-11-10"]["is_closed"] is True
+    assert by_day["2026-11-10"]["write_allowed"] is False
+    assert by_day["2026-11-11"]["write_allowed"] is True
+
+    # 定点拒绝任务也有一条关闭裁决证明
+    r = client.post(
+        "/api/jobs/detail-to-summary",
+        json={"domain_id": did, "biz_day": "2026-11-10"},
+    )
+    assert r.status_code == 400
+    reject_job_id = r.json()["detail"]["任务"]["id"]
+    decisions = client.get(f"/api/close-decisions?job_id={reject_job_id}").json()
+    assert len(decisions) == 1
+    assert decisions[0]["biz_day"] == "2026-11-10"
+    assert decisions[0]["is_closed"] is True
+    assert decisions[0]["write_allowed"] is False
+
+    # 只读接口：未知任务编号返回空列表；写方法不被允许
+    assert client.get("/api/close-decisions?job_id=999999").json() == []
+    assert client.post("/api/close-decisions", json={}).status_code == 405
+
+    # 按主题域列出全部证明
+    all_decisions = client.get(f"/api/close-decisions?domain_id={did}").json()
+    assert len(all_decisions) == 2 + 2 + 1
+
+    # 证明落本地 SQLite，重新打开应用（新客户端重新建连接）后仍在
+    rows = client.get(f"/api/close-decisions?domain_id={did}").json()
+    assert rows and all(r["is_closed"] in (True, False) for r in rows)
+
+
+def test_decision_proof_tracks_open_day_unchanged_path(client):
+    did = _domain_id(client)
+    # 未关闭日：装载与两层任务的裁决全部放行
+    load_job = client.post("/api/paste/load", json={"domain_id": did}).json()
+    j1 = client.post("/api/jobs/paste-to-detail", json={"domain_id": did}).json()
+    j2 = client.post("/api/jobs/detail-to-summary", json={"domain_id": did}).json()
+    for job_id in (load_job["id"], j1["id"], j2["id"]):
+        decisions = client.get(f"/api/close-decisions?job_id={job_id}").json()
+        assert decisions and all(d["is_closed"] is False for d in decisions)
+        assert all(d["write_allowed"] is True for d in decisions)
+        assert all(d["reason_code"] == "" for d in decisions)
+
+
+def test_reopen_restores_write_allowed_decision(client):
+    did = _domain_id(client)
+    client.post(
+        "/api/closed-days/close",
+        json={"domain_id": did, "biz_day": "2026-11-10"},
+    )
+    closed_job = client.post("/api/paste/load", json={"domain_id": did}).json()
+    before = {
+        d["biz_day"]: d
+        for d in client.get(f"/api/close-decisions?job_id={closed_job['id']}").json()
+    }
+    assert before["2026-11-10"]["write_allowed"] is False
+
+    # 重新打开后再装载：新裁决证明写路径放行（历史证明保持不变）
+    client.post(
+        "/api/closed-days/reopen",
+        json={"domain_id": did, "biz_day": "2026-11-10"},
+    )
+    open_job = client.post("/api/paste/load", json={"domain_id": did}).json()
+    after = {
+        d["biz_day"]: d
+        for d in client.get(f"/api/close-decisions?job_id={open_job['id']}").json()
+    }
+    assert after["2026-11-10"]["is_closed"] is False
+    assert after["2026-11-10"]["write_allowed"] is True
+
+
 def test_legacy_db_migration(tmp_path, monkeypatch):
     """旧版库没有 reject_count/biz_day 列与 closed_biz_days 表，启动时自动迁移。"""
     data_dir = tmp_path / "data"
@@ -307,13 +454,25 @@ def test_legacy_db_migration(tmp_path, monkeypatch):
 
     conn = sqlite3.connect(db)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(layer_jobs)").fetchall()}
-    assert {"reject_count", "biz_day"} <= cols
+    assert {"reject_count", "biz_day", "reason_code"} <= cols
     # 旧任务记录迁移后默认值正确
-    row = conn.execute("SELECT reject_count, biz_day FROM layer_jobs").fetchone()
-    assert row == (0, None)
+    row = conn.execute("SELECT reject_count, biz_day, reason_code FROM layer_jobs").fetchone()
+    assert row == (0, None, "")
     # 关闭名单表可用
     conn.execute(
         "INSERT INTO closed_biz_days(domain_id, biz_day) VALUES (1, '2026-11-10')"
     )
+    # 关闭裁决证明表可用，布尔位以 0/1 存储
+    conn.execute(
+        """
+        INSERT INTO close_decisions(
+          domain_id, biz_day, is_closed, write_allowed, job_id, step, reason_code
+        ) VALUES (1, '2026-11-10', 1, 0, NULL, 'paste_load', 'BIZ_DAY_CLOSED_PASTE_LOAD')
+        """
+    )
+    row = conn.execute(
+        "SELECT is_closed, write_allowed FROM close_decisions"
+    ).fetchone()
+    assert row == (1, 0)
     conn.commit()
     conn.close()

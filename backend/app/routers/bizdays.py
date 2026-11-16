@@ -22,6 +22,15 @@ def list_closed(domain_id: int | None = Query(default=None)):
     return pipeline.list_closed_biz_days(domain_id)
 
 
+@router.get("/close-decisions")
+def list_decisions(
+    domain_id: int | None = Query(default=None, description="主题域编号过滤"),
+    job_id: int | None = Query(default=None, description="按分层任务编号只读查询"),
+    load_id: int | None = Query(default=None, description="按贴源装载任务编号只读查询"),
+):
+    return pipeline.list_close_decisions(domain_id, job_id, load_id)
+
+
 @router.get("/biz-days/overview")
 def overview(domain_id: int = Query(..., description="主题域编号")):
     try:

@@ -5,6 +5,7 @@ import { getJson, postJson } from '../api'
 const domains = ref([])
 const domainId = ref(1)
 const rows = ref([])
+const decisions = ref([])
 const err = ref('')
 const busy = ref(false)
 const newDay = ref('')
@@ -12,6 +13,18 @@ const reason = ref('')
 
 async function refresh() {
   rows.value = await getJson(`/api/biz-days/overview?domain_id=${domainId.value}`)
+  decisions.value = await getJson(
+    `/api/close-decisions?domain_id=${domainId.value}`,
+  )
+}
+
+function proofOf(day) {
+  return decisions.value.filter((d) => d.biz_day === day)
+}
+
+function latestProof(day) {
+  const list = proofOf(day)
+  return list.length ? list[list.length - 1] : null
 }
 
 onMounted(async () => {
@@ -91,7 +104,10 @@ async function reopen(day) {
       <h3>业务日名单（与贴源按日计数同源）</h3>
       <table>
         <thead>
-          <tr><th>业务日</th><th>状态</th><th>贴源行数</th><th>关闭原因</th><th>关闭时间</th><th>操作</th></tr>
+          <tr>
+            <th>业务日</th><th>状态</th><th>贴源行数</th><th>关闭原因</th><th>关闭时间</th>
+            <th>最近裁决·是否关闭</th><th>最近裁决·写路径</th><th>裁决证明条数</th><th>操作</th>
+          </tr>
         </thead>
         <tbody>
           <tr v-for="r in rows" :key="r.biz_day">
@@ -103,6 +119,21 @@ async function reopen(day) {
             <td>{{ r.paste_count }}</td>
             <td>{{ r.reason || '—' }}</td>
             <td>{{ r.closed_at || '—' }}</td>
+            <td>
+              <template v-if="latestProof(r.biz_day)">
+                <span v-if="latestProof(r.biz_day).is_closed" class="badge badge-closed">已关闭</span>
+                <span v-else class="badge badge-open">未关闭</span>
+              </template>
+              <span v-else class="muted">—</span>
+            </td>
+            <td>
+              <template v-if="latestProof(r.biz_day)">
+                <span v-if="latestProof(r.biz_day).write_allowed" class="badge badge-open">放行</span>
+                <span v-else class="badge badge-closed">拒绝</span>
+              </template>
+              <span v-else class="muted">—</span>
+            </td>
+            <td>{{ proofOf(r.biz_day).length }}</td>
             <td>
               <button
                 v-if="r.closed"
@@ -116,6 +147,10 @@ async function reopen(day) {
         </tbody>
       </table>
       <p v-if="!rows.length" class="muted">该主题域暂无业务日记录。</p>
+      <p class="muted">
+        裁决证明记录每次装载/分层任务对该日的关闭裁决（目标日、是否关闭、写路径是否放行），
+        可在「分层任务」页按任务编号、在「贴源层」页按装载编号只读查询。
+      </p>
     </div>
   </div>
 </template>

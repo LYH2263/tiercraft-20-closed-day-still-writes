@@ -73,9 +73,26 @@ CREATE TABLE IF NOT EXISTS layer_jobs (
   out_count INTEGER NOT NULL DEFAULT 0,
   drop_count INTEGER NOT NULL DEFAULT 0,
   reject_count INTEGER NOT NULL DEFAULT 0,
+  reason_code TEXT NOT NULL DEFAULT '',
   biz_day TEXT,
   created_at TEXT NOT NULL DEFAULT (datetime('now')),
   FOREIGN KEY(domain_id) REFERENCES domains(id)
+);
+
+-- 关闭裁决证明：每次装载/分层任务对其涉及的每个目标日落一条裁决，
+-- 与关闭名单、贴源按日计数同库同源，刷新与重启后仍在
+CREATE TABLE IF NOT EXISTS close_decisions (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  domain_id INTEGER NOT NULL,
+  biz_day TEXT NOT NULL,
+  is_closed INTEGER NOT NULL,
+  write_allowed INTEGER NOT NULL,
+  job_id INTEGER,
+  step TEXT NOT NULL,
+  reason_code TEXT NOT NULL DEFAULT '',
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  FOREIGN KEY(domain_id) REFERENCES domains(id),
+  FOREIGN KEY(job_id) REFERENCES layer_jobs(id)
 );
 
 CREATE TABLE IF NOT EXISTS reconcile_reports (
@@ -101,6 +118,10 @@ def _migrate(conn) -> None:
         conn.execute("ALTER TABLE layer_jobs ADD COLUMN reject_count INTEGER NOT NULL DEFAULT 0")
     if "biz_day" not in cols:
         conn.execute("ALTER TABLE layer_jobs ADD COLUMN biz_day TEXT")
+    if "reason_code" not in cols:
+        conn.execute(
+            "ALTER TABLE layer_jobs ADD COLUMN reason_code TEXT NOT NULL DEFAULT ''"
+        )
 
 
 def init_db() -> None:
